@@ -13,7 +13,9 @@ acceptance was recorded on October 17, fresh-Fedora readiness on October 18,
 bounded current-tip native acceptance on October 28, and all POST-03 native
 stage adapters landed on October 29. POST-04 combined live acceptance passed
 on October 30 after fixing audit-report propagation and finalization journal
-idempotency. The October 27 refresh below remains **offline regression
+idempotency. A history-free snapshot was then published to the public
+`xjamesmorris/raptor-copilot` repository without exposing the private
+branch-only commits. The October 27 refresh below remains **offline regression
 evidence**.
 
 [The workstream tracker](copilot-todo.md) records MVP-12 documentation

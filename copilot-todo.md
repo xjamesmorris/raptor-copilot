@@ -498,7 +498,7 @@ authorization for additional services.
   Full ignored evidence is under
   `out/copilot-post03-acceptance-20261030/`.
 
-- [ ] **POST-05 - Publish the public repository.**
+- [x] **POST-05 - Publish the public repository.**
 
   **Local preflight completed October 30, 2026:** reachable-history secret
   scanning found only documented fake fixtures/examples/rule data and no
@@ -506,10 +506,10 @@ authorization for additional services.
   dependency installation, version startup, all 39 command metadata checks,
   all 96 release-workflow checks and SCA attribution checks.
 
-  **Remaining operator decision:** all 91 branch-only commits carry one
-  non-noreply personal-domain identity. Publishing full history exposes that
-  address. Recommended publication shape is a sanitized snapshot (or a
-  separately reviewed email rewrite) while retaining `LICENSE`,
-  `CITATION.cff` and the existing calibration attribution. Changing repository
-  visibility, pushing a public branch or creating a public PR still requires
-  fresh explicit approval.
+  **Completed October 30, 2026:** with explicit approval, the history-free
+  snapshot was published to
+  `https://github.com/xjamesmorris/raptor-copilot` as public `main`.
+  Commit `ca03db5f` fast-forwards the destination's existing 6,094 public
+  commits and carries the exact sanitized tree; none of the 91 private
+  branch-only commits or their non-noreply identity entered public history.
+  No force-push, PR, release or tag was created.

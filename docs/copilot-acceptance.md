@@ -83,12 +83,13 @@ Local publication hygiene was run without network access:
 - The branch is 91 commits ahead and zero behind local `upstream/main`; no new
   binary, archive or key-like files were identified.
 
-One privacy choice remains before publication: all 91 branch-only commits use
-one non-noreply personal-domain identity. Full-history publication would expose
-that address. The recommended default is a sanitized snapshot, or a separately
-reviewed email rewrite if preserving detailed history is more important.
-Repository visibility changes, public pushes and public PR creation remain
-external actions requiring fresh explicit approval.
+All 91 branch-only commits use one non-noreply personal-domain identity, so
+full-history publication would expose that address. With explicit approval,
+the sanitized tree was published instead at
+`https://github.com/xjamesmorris/raptor-copilot` as public `main`.
+Commit `ca03db5f` is a normal fast-forward child of the destination's existing
+6,094 public commits and contains none of the 91 private branch-only commits.
+No force-push, PR, release or tag was created.
 
 ## October 27 offline refresh
 
