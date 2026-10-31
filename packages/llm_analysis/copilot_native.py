@@ -1491,22 +1491,25 @@ def attach_audit_handoff(manifest_path: Path) -> dict[str, Any]:
         max_bytes=_MAX_PREP_BYTES,
     )
     phases = aggregate.setdefault("phases", {})
-    phases["audit"] = {
+    audit_phase = {
         "enabled": True,
         "completed": True,
         "audit_dir": str(audit_dir),
         "findings_count": receipt["findings_count"],
+        "coverage_policy": "map_grade_is_not_review",
+        "validation_deferred_to_parent": receipt[
+            "validation_deferred_to_parent"
+        ],
+    }
+    audit_phase.update({
         "reviewed": int(receipt["stats"].get("reviewed") or 0),
         "clean": int(receipt["stats"].get("clean") or 0),
         "suspicious": int(receipt["stats"].get("suspicious") or 0),
         "dormant": int(receipt["stats"].get("dormant") or 0),
         "gaps_remaining": receipt["gaps_remaining"],
-        "coverage_policy": "map_grade_is_not_review",
-        "validation_deferred_to_parent": receipt[
-            "validation_deferred_to_parent"
-        ],
-        "stats": report.get("stats"),
-    }
+    })
+    audit_phase["stats"] = report.get("stats")
+    phases["audit"] = audit_phase
     outputs = aggregate.setdefault("outputs", {})
     outputs["audit_report"] = str(report_path)
     outputs["audit_findings"] = str(findings_path)
